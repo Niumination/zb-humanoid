@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>zb-humanoid</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
+    #canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: block; }
+    #info { position: fixed; top: 16px; left: 16px; color: #0ff; font-size: 12px; z-index: 10; text-shadow: 0 0 8px rgba(0,255,255,0.5); pointer-events: none; }
+    #loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #0ff; font-size: 14px; z-index: 20; text-shadow: 0 0 8px rgba(0,255,255,0.5); }
+    #loading.hidden { display: none; }
+    #lang-switcher { position: fixed; top: 16px; right: 16px; z-index: 20; display: flex; gap: 8px; }
+    #lang-switcher button { background: rgba(0,255,255,0.1); border: 1px solid #0ff; color: #0ff; padding: 4px 8px; cursor: pointer; font-family: inherit; font-size: 11px; }
+    #lang-switcher button:hover { background: rgba(0,255,255,0.3); }
+  </style>
+  <script type="module" crossorigin src="/assets/index-C_phzaLC.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/three-core-ypJDk0lt.js">
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="loading">
+    <div id="loading-text">Loading humanoid...</div>
+  </div>
+  <div id="lang-switcher">
+    <button data-lang="en">EN</button>
+    <button data-lang="id">ID</button>
+    <button data-lang="zh">ZH</button>
+  </div>
+  <div id="info"></div>
+</body>
+</html>
+<script>
+(function() {
+  var el = document.getElementById('debug-overlay');
+  if (!el) return;
+  var msgs = ['main init'];
+  var t = setInterval(function() {
+    if (document.readyState === 'complete') {
+      msgs.push('DOM ready');
+      clearInterval(t);
+    }
+  }, 100);
+  el.textContent = msgs.join('\n');
+})();
+</script>
