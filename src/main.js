@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+import { Scene, Color, PerspectiveCamera, WebGLRenderer, BufferGeometry, BufferAttribute, ShaderMaterial, Points, SphereGeometry, AmbientLight, DirectionalLight, Raycaster, Vector2, AdditiveBlending, ACESFilmicToneMapping } from 'three';
 import { createSoftParticleTexture } from './utils/particleTexture.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { sampleHeadPoints } from './utils/headSampler.js';
@@ -12,7 +12,18 @@ import { setLanguage, t } from './utils/i18n.js';
 import { setPerformanceMode, getPerformanceMode, getPerformancePresets, detectOptimalMode } from './utils/performance.js';
 import { startMoodPack, stopMoodPack, getMoodPacks, getCurrentPack } from './utils/moodPacks.js';
 import { startRecording, stopRecording, isRecordingActive } from './utils/recording.js';
-import { setSkin, getSkins, getSkinConfig } from './utils/skins.js';
+import { setSkin, getSkins, getSkinConfig, getSkin } from './utils/skins.js';
+import { createPolishedAssembly } from './utils/assemblyPolished.js';
+import { createExpressionBlends, applyExpression } from './utils/expressions.js';
+import { sampleBestHead } from './utils/hybridSampler.js';
+
+
+// DEBUG: inline debug overlay
+const debug = (() => { 
+  const el = document.getElementById('debug-overlay'); 
+  if (!el) return { log: () => {} }; 
+  return { log(msg) { el.textContent += (el.textContent ? '\n' : '') + '[' + new Date().toLocaleTimeString() + '] ' + msg; } }; 
+})();
 
 const CONFIG = {
   PARTICLE_COUNT: 300000,
@@ -30,15 +41,17 @@ const state = {
 };
 
 const container = document.getElementById('canvas');
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x050505);
+const scene = new Scene();
+scene.background = new Color(0x050505);
 
-const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
+const camera = new PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
 camera.position.set(0, 0, 4);
 
-const renderer = new THREE.WebGLRenderer({ canvas: container, antialias: true, preserveDrawingBuffer: true });
+const renderer = new WebGLRenderer({ canvas: container, antialias: true, preserveDrawingBuffer: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -49,9 +62,6 @@ const statsEl = document.getElementById('stats');
 const loadingEl = document.getElementById('loading');
 const loadingTextEl = document.getElementById('loading-text');
 
-// DEBUG: inline debug overlay
-const debug = (() => { const el = document.getElementById('debug-overlay'); if (!el) return { log: () => {} }; return { log(msg) { el.textContent += (el.textContent ? '\n' : '') + '[' + new Date().toLocaleTimeString() + '] ' + msg; } }; })();
-debug.log('main init');
 
 let skinConfig = getSkinConfig();
 
@@ -63,7 +73,6 @@ const vertexShader = `
   varying float vDepth;
   
   uniform float time;
-  uniform vec3 cameraPosition;
   
   void main() {
     vPosition = position;
@@ -90,7 +99,6 @@ const vertexShader = `
 const fragmentShader = `
   uniform vec3 color;
   uniform sampler2D particleTexture;
-  uniform vec3 cameraPosition;
   
   varying vec3 vPosition;
   varying float vRandom;
@@ -123,19 +131,19 @@ const fragmentShader = `
 `;
 
 function createParticles(positions) {
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const geometry = new BufferGeometry();
+  geometry.setAttribute('position', new BufferAttribute(positions, 3));
   const sizes = new Float32Array(positions.length / 3);
   const randoms = new Float32Array(positions.length / 3);
   for (let i = 0; i < sizes.length; i++) {
-    sizes[i] = 1.5;
+    sizes[i] = 0.9 + Math.random() * 1.4; // varied sizes for light-figure look
     randoms[i] = Math.random();
   }
-  geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
-  geometry.setAttribute('random', new THREE.BufferAttribute(randoms, 1));
-  const material = new THREE.ShaderMaterial({
+  geometry.setAttribute('size', new BufferAttribute(sizes, 1));
+  geometry.setAttribute('random', new BufferAttribute(randoms, 1));
+  const material = new ShaderMaterial({
     uniforms: {
-      color: { value: new THREE.Color(CONFIG.COLOR) },
+      color: { value: new Color(CONFIG.COLOR) },
       particleTexture: { value: createSoftParticleTexture() },
       time: { value: 0 },
       cameraPosition: { value: camera.position }
@@ -144,14 +152,15 @@ function createParticles(positions) {
     fragmentShader,
     transparent: true,
     depthWrite: false,
+    blending: AdditiveBlending,
   });
-  const points = new THREE.Points(geometry, material);
+  const points = new Points(geometry, material);
   scene.add(points);
   return points;
 }
 
 function createSphereFallback() {
-  const geo = new THREE.SphereGeometry(1.5, 64, 64);
+  const geo = new SphereGeometry(1.5, 64, 64);
   const pos = geo.getAttribute('position').array;
   const sampled = new Float32Array(CONFIG.PARTICLE_COUNT * 3);
   for (let i = 0; i < CONFIG.PARTICLE_COUNT; i++) {
@@ -166,6 +175,7 @@ function createSphereFallback() {
 
 let particles = createSphereFallback();
 let assembly = null;
+let morphTargets = null;
 let expressionBlends = null;
 let currentExpression = null;
 let basePositions = null;
@@ -187,7 +197,7 @@ async function loadHeadModel() {
   try {
     updateLoadingText('Sampling head model...');
     debug.log('sampling head');
-    const positions = await sampleBestHead('/assets/head.glb', CONFIG.PARTICLE_COUNT);
+    const positions = await sampleBestHead(CONFIG.PARTICLE_COUNT);
     updateLoadingText('Building particles...');
     debug.log('building particles');
     scene.remove(particles);
@@ -368,6 +378,13 @@ function animate() {
   fpsTime += dt;
   if (fpsTime >= 1) {
     if (statsEl) statsEl.textContent = `FPS: ${frameCount} | Particles: ${particles.geometry.attributes.position.count}`;
+    // Auto-degrade on sustained low FPS (software GL / weak GPU)
+    if (frameCount < 12 && state.time > 8 && !window.__degraded) {
+      window.__degraded = true;
+      renderer.setPixelRatio(1);
+      if (postProcessing) postProcessing.resize(innerWidth, innerHeight);
+      console.warn('Low FPS detected: reduced pixel ratio to 1');
+    }
     frameCount = 0;
     fpsTime = 0;
   }
