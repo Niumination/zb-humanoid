@@ -2,7 +2,7 @@ import { Scene, Color, PerspectiveCamera, WebGLRenderer, BufferGeometry, BufferA
 import { createSoftParticleTexture } from './utils/particleTexture.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { sampleHeadPoints } from './utils/headSampler.js';
-import { createAssemblyAnimation, createMorphTargets, lerpPositions } from './utils/animations.js';
+import { createMorphTargets, lerpPositions } from './utils/animations.js';
 import { applyBreathing, applyShockwave } from './utils/effects.js';
 import { setupAudioReactivity } from './utils/audioReactivity.js';
 import { setupUIControls } from './utils/controls.js';
@@ -99,6 +99,7 @@ const vertexShader = `
 const fragmentShader = `
   uniform vec3 color;
   uniform sampler2D particleTexture;
+  uniform float flash;
   
   varying vec3 vPosition;
   varying float vRandom;
@@ -117,8 +118,8 @@ const fragmentShader = `
     float rim = 1.0 - abs(dot(viewDir, vec3(0.0, 0.0, 1.0)));
     rim = pow(rim, 3.0) * 0.5;
     
-    // Color with rim highlight
-    vec3 finalColor = color + rim * 0.3;
+    // Color with rim highlight + assembly-complete flash
+    vec3 finalColor = color + rim * 0.3 + flash;
     
     // Subtle color variation per particle
     finalColor += (vRandom - 0.5) * 0.1;
@@ -146,7 +147,8 @@ function createParticles(positions) {
       color: { value: new Color(CONFIG.COLOR) },
       particleTexture: { value: createSoftParticleTexture() },
       time: { value: 0 },
-      cameraPosition: { value: camera.position }
+      cameraPosition: { value: camera.position },
+      flash: { value: 0 }
     },
     vertexShader,
     fragmentShader,
@@ -205,7 +207,19 @@ async function loadHeadModel() {
     particles.material.dispose();
     basePositions = new Float32Array(positions);
     particles = createParticles(basePositions);
-    assembly = createPolishedAssembly(basePositions, 3.0);
+    assembly = createPolishedAssembly(basePositions, 2.5);
+    // Bloom flash when assembly completes (spec v2 §3.3)
+    assembly.onComplete = () => {
+      const u = particles.material && particles.material.uniforms;
+      if (!u || !u.flash) return;
+      const t0 = performance.now();
+      const pulse = () => {
+        const e = (performance.now() - t0) / 900;
+        u.flash.value = Math.max(0, 0.9 * (1 - e));
+        if (e < 1) requestAnimationFrame(pulse);
+      };
+      pulse();
+    };
     morphTargets = createMorphTargets(basePositions);
     expressionBlends = createExpressionBlends(basePositions);
     audioReactivity = setupAudioReactivity(particles, basePositions);
@@ -236,18 +250,12 @@ function applyMood(mood) {
   state.targetMood = mood;
   state.morphProgress = 0;
   currentExpression = mood;
-  
+
   if (!particles.material || !particles.material.uniforms) return;
   const cfg = MOODS[mood] || MOODS.neutral;
   particles.material.uniforms.color.value.set(cfg.color);
   controls.autoRotateSpeed = cfg.speed;
-  
-  // Apply expression morphing
-  if (expressionBlends && basePositions) {
-    const morphed = applyExpression(basePositions, expressionBlends, mood, 0.6);
-    particles.geometry.attributes.position.array.set(morphed);
-    particles.geometry.attributes.position.needsUpdate = true;
-  }
+  // Position morphing is applied per-frame in animate() via morphProgress.
 }
 
 let lastTime = performance.now();
@@ -342,20 +350,26 @@ function animate() {
   state.time += dt;
 
   let nextPositions = null;
-  if (state.audioEnabled && audioReactivity) {
-    nextPositions = audioReactivity.tick(state.time);
+
+  // Layered pipeline: assembly -> expression+breathing -> audio override.
+  // Expressions are recomputed every frame on top of base, otherwise the
+  // per-frame breathing write silently discards the mood morph (old bug).
+  if (assembly && assembly.playing) {
+    nextPositions = assembly.tick(dt);
+  } else if (basePositions) {
+    let layer = basePositions;
+    if (expressionBlends && state.targetMood && state.morphProgress < 1) {
+      state.morphProgress = Math.min(1, state.morphProgress + dt / 0.6);
+      layer = applyExpression(basePositions, expressionBlends, state.targetMood, 0.6 * state.morphProgress);
+    }
+    nextPositions = applyBreathing(layer, state.time, 0.012);
   }
 
-  if (nextPositions && basePositions) {
+  const audioPositions = (state.audioEnabled && audioReactivity) ? audioReactivity.tick(state.time) : null;
+  if (audioPositions) nextPositions = audioPositions;
+
+  if (nextPositions) {
     particles.geometry.attributes.position.array.set(nextPositions);
-    particles.geometry.attributes.position.needsUpdate = true;
-  } else if (assembly && basePositions) {
-    const pos = assembly.tick(dt);
-    particles.geometry.attributes.position.array.set(pos);
-    particles.geometry.attributes.position.needsUpdate = true;
-  } else if (basePositions && !assembly && !state.targetMood) {
-    const breathPos = applyBreathing(basePositions, state.time, 0.012);
-    particles.geometry.attributes.position.array.set(breathPos);
     particles.geometry.attributes.position.needsUpdate = true;
   }
 
@@ -378,16 +392,32 @@ function animate() {
   fpsTime += dt;
   if (fpsTime >= 1) {
     if (statsEl) statsEl.textContent = `FPS: ${frameCount} | Particles: ${particles.geometry.attributes.position.count}`;
-    // Auto-degrade on sustained low FPS (software GL / weak GPU)
-    if (frameCount < 12 && state.time > 8 && !window.__degraded) {
-      window.__degraded = true;
-      renderer.setPixelRatio(1);
-      if (postProcessing) postProcessing.resize(innerWidth, innerHeight);
-      console.warn('Low FPS detected: reduced pixel ratio to 1');
+    // Auto-degrade on sustained low FPS (software GL / weak GPU):
+    // step down through performance presets, which disables bloom at 'low'.
+    if (frameCount < 15 && state.time > 8) {
+      const order = ['high', 'balanced', 'low'];
+      const idx = order.indexOf(getPerformanceMode());
+      if (idx < order.length - 1) {
+        const next = order[idx + 1];
+        applyPerformancePreset(next);
+        console.warn('Low FPS: switched performance mode to', next);
+      }
     }
     frameCount = 0;
     fpsTime = 0;
   }
+}
+
+// Performance presets actually affect rendering (Goldfish finding #8)
+function applyPerformancePreset(mode) {
+  const cfg = setPerformanceMode(mode);
+  state.performanceMode = mode;
+  renderer.setPixelRatio(cfg.pixelRatio);
+  // Bloom off -> render directly; on -> composer
+  postProcessing = cfg.bloom ? createPostProcessing(renderer, scene, camera) : null;
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
 }
 
 debug.log('animate start');
