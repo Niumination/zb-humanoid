@@ -27,6 +27,12 @@ export function createPostProcessing(renderer, scene, camera) {
     resize(width, height) {
       composer.setSize(width, height);
       bloomPass.resolution.set(width, height);
+    },
+    setBloomColor(color) {
+      // Bloom tint approximation: boost bloom strength briefly on skin change
+      bloomPass.strength = 2.0;
+      setTimeout(() => { bloomPass.strength = 1.4; }, 600);
+      void color;
     }
   };
 
