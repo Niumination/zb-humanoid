@@ -268,6 +268,7 @@ addEventListener('resize', () => {
 });
 
 addEventListener('keydown', (e) => {
+  if (e.repeat) return; // ignore held keys — toggles must fire once per press
   const moodKeys = { '1': 'neutral', '2': 'happy', '3': 'sad', '4': 'angry', '5': 'excited', '6': 'calm' };
   if (moodKeys[e.key]) applyMood(moodKeys[e.key]);
   if (e.key === ' ' && assembly) assembly.reset();
@@ -380,7 +381,9 @@ function animate() {
     nextPositions = assembly.tick(dt);
   } else if (basePositions) {
     let layer = basePositions;
-    if (expressionBlends && state.targetMood && state.morphProgress < 1) {
+    // Expression is ALWAYS applied on top of base once a mood is chosen —
+    // otherwise skipping the layer after morphProgress >= 1 snaps back to neutral (Goldfish F1).
+    if (expressionBlends && state.targetMood && state.targetMood !== 'neutral') {
       state.morphProgress = Math.min(1, state.morphProgress + dt / 0.6);
       layer = applyExpression(basePositions, expressionBlends, state.targetMood, 0.6 * state.morphProgress);
     }
@@ -417,7 +420,7 @@ function animate() {
     // Auto-degrade on sustained low FPS (software GL / weak GPU):
     // step down through performance presets, which disables bloom at 'low'.
     if (frameCount < 15 && state.time > 8) {
-      const order = ['high', 'balanced', 'low'];
+      const order = ['high', 'balanced', 'low', 'ultra'];
       const idx = order.indexOf(getPerformanceMode());
       if (idx < order.length - 1) {
         const next = order[idx + 1];
