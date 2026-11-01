@@ -2,7 +2,7 @@ import { Scene, Color, PerspectiveCamera, WebGLRenderer, BufferGeometry, BufferA
 import { createSoftParticleTexture } from './utils/particleTexture.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { sampleHeadPoints } from './utils/headSampler.js';
-import { createMorphTargets, lerpPositions } from './utils/animations.js';
+import { createMorphTargets } from './utils/animations.js';
 import { applyBreathing, applyShockwave } from './utils/effects.js';
 import { setupAudioReactivity } from './utils/audioReactivity.js';
 import { setupUIControls } from './utils/controls.js';
@@ -191,7 +191,6 @@ function hideLoading() {
 
 function updateLoadingText(text) {
   if (loadingTextEl) loadingTextEl.textContent = text;
-  if (loadingEl) loadingEl.classList.add('hidden');
 }
 
 async function loadHeadModel() {
@@ -200,8 +199,8 @@ async function loadHeadModel() {
     updateLoadingText('Sampling head model...');
     debug.log('sampling head');
     const positions = await sampleBestHead(CONFIG.PARTICLE_COUNT);
-    updateLoadingText('Building particles...');
     debug.log('building particles');
+    updateLoadingText('Building particles...');
     scene.remove(particles);
     particles.geometry.dispose();
     particles.material.dispose();
@@ -225,7 +224,7 @@ async function loadHeadModel() {
     audioReactivity = setupAudioReactivity(particles, basePositions);
     postProcessing = createPostProcessing(renderer, scene, camera);
     capture = setupCapture(renderer, scene, camera);
-    updateLoadingText('Ready');
+    updateLoadingText(t('ready'));
     debug.log('ready');
     setTimeout(hideLoading, 300);
   } catch (err) {
@@ -279,7 +278,22 @@ addEventListener('keydown', (e) => {
     }
   }
   if (e.key.toLowerCase() === 'r') {
-    applyShockwave(basePositions, particles, state.time);
+    // Shockwave: animate a one-shot ripple expanding from center over 1.2s
+    if (!particles || !basePositions) return;
+    const t0 = performance.now();
+    const wave = () => {
+      const e = (performance.now() - t0) / 1200;
+      if (e >= 1) {
+        particles.geometry.attributes.position.array.set(basePositions);
+        particles.geometry.attributes.position.needsUpdate = true;
+        return;
+      }
+      const pos = applyShockwave(basePositions, e * Math.PI * 2, [0, 0, 0], 0.25 * (1 - e));
+      particles.geometry.attributes.position.array.set(pos);
+      particles.geometry.attributes.position.needsUpdate = true;
+      requestAnimationFrame(wave);
+    };
+    wave();
   }
   if (e.key.toLowerCase() === 's') {
     if (capture) capture.downloadScreenshot();
@@ -317,6 +331,14 @@ addEventListener('keydown', (e) => {
     const next = skins[(skins.indexOf(current) + 1) % skins.length];
     const config = setSkin(next);
     skinConfig = config;
+    // Apply skin colors to the actual scene (particles, background, bloom)
+    if (particles && particles.material && particles.material.uniforms) {
+      particles.material.uniforms.color.value.set(config.particleColor);
+    }
+    scene.background = new Color(config.bgColor);
+    if (postProcessing && postProcessing.setBloomColor) {
+      postProcessing.setBloomColor(config.bloomColor);
+    }
     updateLoadingText(`Skin: ${next}`);
     setTimeout(() => { if (loadingEl) loadingEl.classList.add('hidden'); }, 1000);
   }
