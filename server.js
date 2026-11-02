@@ -2,6 +2,7 @@ import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs';
+import { WebSocketServer } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -11,6 +12,34 @@ const PORT = process.env.PORT || 3001;
 
 app.use(express.json());
 app.use(express.static(join(__dirname, 'dist')));
+
+const AGENT_TOKEN = process.env.ZB_HUMANOID_AGENT_TOKEN || '';
+
+// Live browser connections (agent-control bridge). Each browser opens /ws and
+// reports real state; control commands are forwarded to it. When no browser is
+// connected, control endpoints report that honestly instead of faking success.
+const browserClients = new Set();
+let commandSeq = 0;
+const pendingCommands = new Map(); // id -> { resolve, timer }
+
+function forwardCommand(command, params, timeoutMs = 8000) {
+  const client = [...browserClients].find(c => c.readyState === 1 && c.isAgentBridge);
+  if (!client) {
+    return Promise.resolve({ success: false, error: 'no browser connected' });
+  }
+  const id = `cmd_${++commandSeq}`;
+  return new Promise((resolve) => {
+    pendingCommands.set(id, { resolve });
+    const timer = setTimeout(() => {
+      if (pendingCommands.has(id)) {
+        pendingCommands.delete(id);
+        resolve({ success: false, error: 'command timeout' });
+      }
+    }, timeoutMs);
+    timer.unref?.();
+    client.send(JSON.stringify({ type: 'command', id, command, params }));
+  });
+}
 
 const WEBHOOK_SECRET = process.env.ZB_HUMANOID_WEBHOOK_SECRET;
 if (!WEBHOOK_SECRET) {
@@ -32,6 +61,7 @@ app.get('/api/humanoid/status', (req, res) => {
     service: 'zb-humanoid',
     version: '0.5.0',
     particles: 300000,
+    agentControl: { transport: 'websocket', path: '/ws', connectedBrowsers: browserClients.size },
     features: ['assembly', 'moods', 'audio-reactivity', 'ui-controls', 'post-processing', 'capture', 'performance', 'mood-packs', 'recording', 'skins', 'i18n'],
     deployment: 'vercel',
     publicUrl: 'https://zb-humanoid.abstract.biz.id',
@@ -51,48 +81,28 @@ app.get('/api/humanoid/status', (req, res) => {
   });
 });
 
-app.get('/api/humanoid/state', (req, res) => {
-  res.json({
-    mood: 'neutral',
-    audioEnabled: false,
-    particles: 300000,
-    performanceMode: 'balanced',
-    skin: 'default',
-    lastUpdated: Date.now()
-  });
+app.get('/api/humanoid/state', async (req, res) => {
+  // Live state from a connected browser; honest empty answer otherwise
+  const result = await forwardCommand('state', {});
+  if (result.success) return res.json(result.state);
+  res.json({ connected: false, error: result.error, lastUpdated: Date.now() });
 });
 
-app.post('/api/humanoid/control', express.json(), (req, res) => {
+app.post('/api/humanoid/control', express.json(), async (req, res) => {
   const { action, params } = req.body || {};
-  
-  switch (action) {
-    case 'mood':
-      res.json({ success: true, action, mood: params?.mood || 'neutral' });
-      break;
-    case 'assemble':
-      res.json({ success: true, action, message: 'Assembly animation triggered' });
-      break;
-    case 'audio':
-      res.json({ success: true, action, enabled: params?.enabled ?? true });
-      break;
-    case 'particles':
-      res.json({ success: true, action, count: params?.count || 300000 });
-      break;
-    case 'screenshot':
-      res.json({ success: true, action, message: 'Screenshot captured' });
-      break;
-    case 'performance':
-      res.json({ success: true, action, mode: params?.mode || 'balanced' });
-      break;
-    case 'mood-pack':
-      res.json({ success: true, action, pack: params?.pack || 'calm' });
-      break;
-    case 'skin':
-      res.json({ success: true, action, skin: params?.skin || 'default' });
-      break;
-    default:
-      res.status(400).json({ success: false, error: 'Unknown action' });
-  }
+  const commandMap = {
+    mood: 'mood',
+    assemble: 'assemble',
+    audio: 'audio',
+    particles: 'particles',
+    screenshot: 'screenshot',
+    performance: 'performance',
+    skin: 'skin'
+  };
+  const command = commandMap[action];
+  if (!command) return res.status(400).json({ success: false, error: 'Unknown action' });
+  const result = await forwardCommand(command, params);
+  res.json({ success: result.success, action, ...(result.success ? result : { error: result.error }) });
 });
 
 app.post('/api/humanoid/webhook', express.json(), (req, res) => {
@@ -164,11 +174,12 @@ app.get('/.well-known/agent-card.json', (req, res) => {
     version: '0.5.0',
     provider: { organization: 'zb-humanoid', url: publicUrl },
     supportedInterfaces: [{ url: publicUrl, protocolBinding: 'JSONRPC', protocolVersion: '1.0' }],
-    capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false, extendedAgentCard: false },
+    capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false, extendedAgentCard: false, liveControl: true },
+    controlTransport: { type: 'websocket', path: '/ws', auth: 'token (ZB_HUMANOID_AGENT_TOKEN)' },
     defaultInputModes: ['text/plain'],
     defaultOutputModes: ['text/plain'],
     skills: [
-      { id: 'humanoid.control', name: 'control', description: 'Control humanoid mood/assembly/audio/screenshot/performance/skin', tags: ['mood', 'assemble', 'audio', 'screenshot', 'performance', 'skin'] },
+      { id: 'humanoid.control', name: 'control', description: 'Control a live browser session: mood/assembly/audio/particles/performance/skin/screenshot (requires a connected browser)', tags: ['mood', 'assemble', 'audio', 'screenshot', 'performance', 'skin', 'particles'] },
       { id: 'humanoid.status', name: 'status', description: 'Get humanoid status, metrics, performance, mood packs, skins', tags: ['status', 'health', 'metrics'] }
     ]
   });
@@ -183,6 +194,50 @@ app.get('*', (req, res) => {
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+// Express app is consumed by http server below (needed for WebSocket upgrade)
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`zb-humanoid server running on port ${PORT}`);
+});
+
+// WebSocket endpoint for the browser agent-control bridge
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, 'http://localhost');
+  if (url.pathname !== '/ws') return socket.destroy();
+  // Token gate: if AGENT_TOKEN set, require exact match; if unset, allow only loopback
+  const token = url.searchParams.get('token') || '';
+  if (AGENT_TOKEN) {
+    if (token !== AGENT_TOKEN) return socket.destroy();
+  } else {
+    const remote = req.socket.remoteAddress || '';
+    const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote);
+    if (!loopback) {
+      console.warn(`[ws] rejected unauthenticated connection from ${remote} — set ZB_HUMANOID_AGENT_TOKEN to allow remote`);
+      return socket.destroy();
+    }
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+
+wss.on('connection', (ws) => {
+  ws.isAgentBridge = true;
+  browserClients.add(ws);
+  ws.on('message', (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (msg.type === 'result' && msg.id && pendingCommands.has(msg.id)) {
+      const { resolve } = pendingCommands.get(msg.id);
+      pendingCommands.delete(msg.id);
+      resolve(msg);
+    }
+    // 'hello'/'state' messages are informational; latest state could be cached here if needed
+  });
+  ws.on('close', () => browserClients.delete(ws));
+  ws.on('error', () => browserClients.delete(ws));
 });
