@@ -89,6 +89,16 @@ app.get('/api/humanoid/state', async (req, res) => {
 });
 
 app.post('/api/humanoid/control', express.json(), async (req, res) => {
+  // Control is powerful — same auth posture as the WS bridge (Goldfish F1)
+  const token = req.body?.token || req.get('x-agent-token') || req.query.token || '';
+  if (AGENT_TOKEN) {
+    if (token !== AGENT_TOKEN) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  } else {
+    // Behind cloudflared the socket is always loopback — trust CF-Connecting-IP when present
+    const remote = req.get('cf-connecting-ip') || req.socket.remoteAddress || '';
+    const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote);
+    if (!loopback) return res.status(401).json({ success: false, error: 'Unauthorized (set ZB_HUMANOID_AGENT_TOKEN for remote control)' });
+  }
   const { action, params } = req.body || {};
   const commandMap = {
     mood: 'mood',
