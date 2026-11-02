@@ -506,6 +506,9 @@ function setParticleCount(count) {
   morphTargets = createMorphTargets(reduced);
   expressionBlends = createExpressionBlends(reduced);
   assembly = createPolishedAssembly(reduced, 2.5);
+  // Rebuild consumers bound to the old particles object (Goldfish F2):
+  // audioReactivity wrote into the disposed geometry; capture/renderer refs too.
+  audioReactivity = setupAudioReactivity(particles, reduced);
   return { success: true, count };
 }
 
@@ -543,8 +546,10 @@ const agentControl = setupAgentControl(getLiveState, {
   },
   screenshot() {
     if (!capture) return { success: false, error: 'capture not ready' };
+    // Return image data to the agent instead of only downloading browser-side (Goldfish F3)
+    const dataURL = renderer.domElement.toDataURL('image/png');
     capture.downloadScreenshot(`zb-humanoid-agent-${Date.now()}.png`);
-    return { success: true, message: 'Screenshot downloaded' };
+    return { success: true, message: 'Screenshot captured', image: { encoding: 'base64png', sizeBytes: dataURL.length, dataUrl: dataURL } };
   }
 }, new URLSearchParams(location.search).get('agentToken') || '');
 
