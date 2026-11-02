@@ -16,6 +16,7 @@ import { setSkin, getSkins, getSkinConfig, getSkin } from './utils/skins.js';
 import { createPolishedAssembly } from './utils/assemblyPolished.js';
 import { createExpressionBlends, applyExpression } from './utils/expressions.js';
 import { sampleBestHead } from './utils/hybridSampler.js';
+import { setupAgentControl } from './utils/agentControl.js';
 
 
 // DEBUG: inline debug overlay
@@ -47,11 +48,31 @@ scene.background = new Color(0x050505);
 const camera = new PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
 camera.position.set(0, 0, 4);
 
-const renderer = new WebGLRenderer({ canvas: container, antialias: true, preserveDrawingBuffer: true });
+let renderer;
+try {
+  renderer = new WebGLRenderer({ canvas: container, antialias: true, preserveDrawingBuffer: true });
+} catch (err) {
+  // WebGL creation failed — show a readable message instead of a stuck loader (Goldfish finding)
+  console.error('[zb-humanoid] WebGL not available:', err);
+  const lt = document.getElementById('loading-text');
+  if (lt) lt.textContent = 'WebGL is not available in this browser';
+  throw err;
+}
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.15;
+
+// Graceful failure when WebGL is unavailable (Goldfish finding):
+// without this, module death = black screen with the loading overlay stuck forever.
+renderer.domElement.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  console.error('[zb-humanoid] WebGL context lost — rendering halted. Reload to recover.');
+  if (loadingEl) {
+    loadingEl.classList.remove('hidden');
+    if (loadingTextEl) loadingTextEl.textContent = 'WebGL context lost — please reload';
+  }
+});
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -448,3 +469,82 @@ function applyPerformancePreset(mode) {
 debug.log('animate start');
 animate();
 loadHeadModel();
+
+// === Agent control bridge (replaces stub REST endpoints with live WebSocket control) ===
+
+function getLiveState() {
+  return {
+    mood: state.mood || 'neutral',
+    audioEnabled: !!state.audioEnabled,
+    particles: particles ? particles.geometry.attributes.position.count : CONFIG.PARTICLE_COUNT,
+    performanceMode: state.performanceMode || 'balanced',
+    skin: getSkin(),
+    ready: !!basePositions,
+    fps: frameCount,
+    lastUpdated: Date.now()
+  };
+}
+
+// Particle count change: resample current geometry (kept cheap — scale/keep existing base)
+function setParticleCount(count) {
+  if (!basePositions) return { success: false, error: 'not ready' };
+  count = Math.max(1000, Math.min(500000, count | 0));
+  if (count === basePositions.length / 3) return { success: true, count };
+  const reduced = new Float32Array(count * 3);
+  const stride = basePositions.length / count;
+  for (let i = 0; i < count; i++) {
+    const src = (i * stride | 0) * 3;
+    reduced[i * 3] = basePositions[src];
+    reduced[i * 3 + 1] = basePositions[src + 1];
+    reduced[i * 3 + 2] = basePositions[src + 2];
+  }
+  scene.remove(particles);
+  particles.geometry.dispose();
+  particles.material.dispose();
+  basePositions = reduced;
+  particles = createParticles(reduced);
+  morphTargets = createMorphTargets(reduced);
+  expressionBlends = createExpressionBlends(reduced);
+  assembly = createPolishedAssembly(reduced, 2.5);
+  return { success: true, count };
+}
+
+const agentControl = setupAgentControl(getLiveState, {
+  applyMood(mood) {
+    if (!MOODS[mood]) return null;
+    applyMood(mood);
+    return mood;
+  },
+  assemble() {
+    if (assembly) assembly.reset();
+  },
+  toggleAudio(enable) {
+    if (state.audioEnabled !== enable) {
+      state.audioEnabled = enable;
+      if (enable && audioReactivity && !audioReactivity.isActive()) audioReactivity.init();
+    }
+    return state.audioEnabled;
+  },
+  setParticleCount,
+  setPerformance(mode) {
+    if (!['high', 'balanced', 'low', 'ultra'].includes(mode)) return { success: false, error: 'invalid mode' };
+    applyPerformancePreset(mode);
+    return { success: true, mode };
+  },
+  setSkin(skinName) {
+    const cfg = setSkin(skinName);
+    if (getSkin() !== skinName) return { success: false, error: 'unknown skin' };
+    skinConfig = cfg;
+    if (particles && particles.material && particles.material.uniforms) {
+      particles.material.uniforms.color.value.set(cfg.particleColor);
+    }
+    scene.background = new Color(cfg.bgColor);
+    return { success: true, skin: skinName };
+  },
+  screenshot() {
+    if (!capture) return { success: false, error: 'capture not ready' };
+    capture.downloadScreenshot(`zb-humanoid-agent-${Date.now()}.png`);
+    return { success: true, message: 'Screenshot downloaded' };
+  }
+}, new URLSearchParams(location.search).get('agentToken') || '');
+
